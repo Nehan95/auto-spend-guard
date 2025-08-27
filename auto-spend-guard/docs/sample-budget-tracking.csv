@@ -1,0 +1,15 @@
+Team,Project,Monthly Budget,Actual Spend,Variance,Variance %,Budget Remaining,Status,Last Updated
+Engineering,User Service,5000.00,4890.25,109.75,2.20%,109.75,On Track,2024-01-20
+Engineering,ML Pipeline,3000.00,3156.25,-156.25,-5.21%,-156.25,Over Budget,2024-01-20
+Engineering,Backend API,4000.00,3987.50,12.50,0.31%,12.50,On Track,2024-01-20
+Data Science,Analytics Platform,2500.00,2340.80,159.20,6.37%,159.20,On Track,2024-01-20
+Data Science,ML Training,1500.00,1450.00,50.00,3.33%,50.00,On Track,2024-01-20
+DevOps,Infrastructure,6000.00,6234.45,-234.45,-3.91%,-234.45,Over Budget,2024-01-20
+DevOps,Monitoring,2000.00,1800.00,200.00,10.00%,200.00,On Track,2024-01-20
+Sales,CRM System,3500.00,3200.00,300.00,8.57%,300.00,On Track,2024-01-20
+Marketing,Digital Campaigns,1200.00,1350.00,-150.00,-12.50%,-150.00,Over Budget,2024-01-20
+Marketing,Content Creation,800.00,750.00,50.00,6.25%,50.00,On Track,2024-01-20
+Design,UI/UX Tools,500.00,450.00,50.00,10.00%,50.00,On Track,2024-01-20
+All Teams,Communication Tools,4500.00,4480.00,20.00,0.44%,20.00,On Track,2024-01-20
+All Teams,Productivity Tools,1000.00,950.00,50.00,5.00%,50.00,On Track,2024-01-20
+All Teams,Cloud Support,1250.00,1250.00,0.00,0.00%,0.00,On Track,2024-01-20
