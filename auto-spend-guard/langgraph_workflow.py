@@ -1,7 +1,10 @@
-from typing import Dict, Any, List, TypedDict
+from typing import Dict, Any, List, TypedDict, Union
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage
+from langchain.agents import AgentExecutor, create_openai_functions_agent
+from langchain.tools import BaseTool
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 import pandas as pd
 from dataloader import DataLoader
 import os
@@ -17,6 +20,210 @@ class WorkflowState(TypedDict):
     relevant_data: Dict[str, Any]
     final_answer: str
     error: str
+
+# Data Retrieval Tools
+class DataRetrievalTool(BaseTool):
+    """Base tool for data retrieval operations"""
+    name: str
+    description: str
+    data_loader: DataLoader = None
+    
+    def _run(self, query: str, **kwargs) -> str:
+        raise NotImplementedError("Subclasses must implement _run")
+    
+    async def _arun(self, query: str, **kwargs) -> str:
+        raise NotImplementedError("Subclasses must implement _arun")
+
+class AWSDataRetrievalTool(DataRetrievalTool):
+    """Tool for retrieving AWS cost data"""
+    name: str = "aws_data_retrieval"
+    description: str = "Retrieves AWS cost data including daily costs, service breakdowns, and cost trends"
+    
+    def __init__(self, data_loader: DataLoader):
+        super().__init__(data_loader=data_loader)
+    
+    def _run(self, query: str, **kwargs) -> str:
+        try:
+            df = self.data_loader.get_dataframe("daily-aws-costs")
+            if df is None:
+                return "No AWS cost data available"
+            
+            # Get the total costs row (Service total)
+            total_row = df[df['Service'] == 'Service total']
+            if total_row.empty:
+                return "No total costs data available"
+            
+            # Get total annual cost
+            total_annual_cost = float(total_row['Total costs($)'].iloc[0])
+            
+            # Get daily data (exclude Service total row)
+            daily_data = df[df['Service'] != 'Service total'].copy()
+            
+            # Convert Service column to datetime for daily analysis
+            daily_data['Date'] = pd.to_datetime(daily_data['Service'], errors='coerce')
+            daily_data = daily_data.dropna(subset=['Date'])
+            
+            if daily_data.empty:
+                return "No daily cost data available"
+            
+            # Calculate daily cost statistics
+            daily_costs = daily_data['Total costs($)'].astype(float)
+            avg_daily_cost = daily_costs.mean()
+            max_daily_cost = daily_costs.max()
+            min_daily_cost = daily_costs.min()
+            
+            # Get recent trends (last 7 days)
+            recent_data = daily_data.tail(7)
+            recent_avg = recent_data['Total costs($)'].astype(float).mean()
+            
+            # Get service breakdown from total row
+            service_columns = [col for col in df.columns if col not in ['Service', 'Total costs($)']]
+            service_breakdown = []
+            for service in service_columns:
+                cost = total_row[service].iloc[0]
+                if cost and str(cost).strip() != '':
+                    try:
+                        service_cost = float(cost)
+                        service_breakdown.append((service.replace('($)', ''), service_cost))
+                    except:
+                        continue
+            
+            # Sort services by cost
+            service_breakdown.sort(key=lambda x: x[1], reverse=True)
+            top_services = service_breakdown[:5]
+            
+            result = f"""
+AWS Cost Data Analysis:
+- Total Annual Cost: ${total_annual_cost:,.2f}
+- Average Daily Cost: ${avg_daily_cost:.2f}
+- Daily Cost Range: ${min_daily_cost:.2f} - ${max_daily_cost:.2f}
+- Recent 7-day Average: ${recent_avg:.2f}
+
+Top Services by Cost:
+{chr(10).join([f"  • {service}: ${cost:.2f}" for service, cost in top_services])}
+
+Data Shape: {df.shape[0]} rows, {df.shape[1]} columns
+            """
+            return result.strip()
+        except Exception as e:
+            return f"Error retrieving AWS data: {str(e)}"
+
+class BudgetDataRetrievalTool(DataRetrievalTool):
+    """Tool for retrieving budget tracking data"""
+    name: str = "budget_data_retrieval"
+    description: str = "Retrieves budget tracking data including project budgets, team spending, and variance analysis"
+    
+    def __init__(self, data_loader: DataLoader):
+        super().__init__(data_loader=data_loader)
+    
+    def _run(self, query: str, **kwargs) -> str:
+        try:
+            df = self.data_loader.get_dataframe("sample-budget-tracking")
+            if df is None:
+                return "No budget tracking data available"
+            
+            # Basic statistics - using correct column names
+            total_budget = df['Monthly Budget'].astype(float).sum()
+            total_spent = df['Actual Spend'].astype(float).sum()
+            variance = total_budget - total_spent
+            variance_pct = (variance / total_budget) * 100 if total_budget > 0 else 0
+            
+            # Project status breakdown
+            status_counts = df['Status'].value_counts()
+            
+            # Top projects by budget
+            top_projects = df.nlargest(5, 'Monthly Budget')[['Project', 'Monthly Budget', 'Actual Spend', 'Status']]
+            
+            # Team breakdown
+            team_budgets = df.groupby('Team')['Monthly Budget'].sum().sort_values(ascending=False)
+            
+            # Over budget projects
+            over_budget = df[df['Variance %'].str.contains('-', na=False)]
+            over_budget_count = len(over_budget)
+            
+            result = f"""
+Budget Tracking Analysis:
+- Total Monthly Budget: ${total_budget:,.2f}
+- Total Actual Spend: ${total_spent:,.2f}
+- Variance: ${variance:,.2f} ({variance_pct:+.1f}%)
+- Projects Over Budget: {over_budget_count}
+
+Project Status Breakdown:
+{status_counts.to_string()}
+
+Top 5 Projects by Budget:
+{top_projects.to_string()}
+
+Team Budget Allocation:
+{team_budgets.to_string()}
+
+Data Shape: {df.shape[0]} rows, {df.shape[1]} columns
+            """
+            return result.strip()
+        except Exception as e:
+            return f"Error retrieving budget data: {str(e)}"
+
+class VendorDataRetrievalTool(DataRetrievalTool):
+    """Tool for retrieving vendor spending data"""
+    name: str = "vendor_data_retrieval"
+    description: str = "Retrieves vendor spending data including contract details, risk assessment, and spending patterns"
+    
+    def __init__(self, data_loader: DataLoader):
+        super().__init__(data_loader=data_loader)
+    
+    def _run(self, query: str, **kwargs) -> str:
+        try:
+            # Try CSV first, then JSON
+            df = self.data_loader.get_dataframe("sample-vendor-data")
+            if df is None:
+                df = self.data_loader.get_dataframe("sample-vendor-data-json")
+            
+            if df is None:
+                return "No vendor data available"
+            
+            # Basic statistics - using correct column names
+            total_budget = df['Annual Budget Approved'].astype(float).sum()
+            total_spend = df['Current Annual Spend'].astype(float).sum()
+            budget_utilization = (total_spend/total_budget*100) if total_budget > 0 else 0
+            
+            # Risk level breakdown
+            risk_counts = df['Risk Level'].value_counts()
+            risk_analysis = f"\nRisk Level Breakdown:\n{risk_counts.to_string()}"
+            
+            # Vendor types
+            type_counts = df['Vendor Type'].value_counts()
+            type_analysis = f"\nVendor Type Breakdown:\n{type_counts.to_string()}"
+            
+            # Status breakdown
+            status_counts = df['Status'].value_counts()
+            status_analysis = f"\nStatus Breakdown:\n{status_counts.to_string()}"
+            
+            # Top vendors by budget
+            top_vendors = df.nlargest(5, 'Annual Budget Approved')[['Vendor Name', 'Vendor Type', 'Annual Budget Approved', 'Current Annual Spend', 'Risk Level']]
+            
+            # Contract analysis
+            active_contracts = len(df[df['Status'] == 'Active'])
+            total_contracts = len(df)
+            
+            result = f"""
+Vendor Spending Analysis:
+- Total Annual Budget: ${total_budget:,.2f}
+- Total Current Spend: ${total_spend:,.2f}
+- Budget Utilization: {budget_utilization:.1f}%
+- Active Contracts: {active_contracts}/{total_contracts}
+
+{risk_analysis}
+{type_analysis}
+{status_analysis}
+
+Top 5 Vendors by Budget:
+{top_vendors.to_string()}
+
+Data Shape: {df.shape[0]} rows, {df.shape[1]} columns
+            """
+            return result.strip()
+        except Exception as e:
+            return f"Error retrieving vendor data: {str(e)}"
 
 class SpendAnalyzerWorkflow:
     """LangGraph workflow for analyzing spending data with classification and retrieval"""
@@ -40,8 +247,150 @@ class SpendAnalyzerWorkflow:
         # Load all data
         self.data_loader.load_all_data()
         
+        # Initialize data retrieval tools
+        self.aws_tool = AWSDataRetrievalTool(self.data_loader)
+        self.budget_tool = BudgetDataRetrievalTool(self.data_loader)
+        self.vendor_tool = VendorDataRetrievalTool(self.data_loader)
+        
+        # Create the data retrieval agent
+        self.data_retrieval_agent = self._create_data_retrieval_agent()
+        
         # Create the workflow graph
         self.workflow = self._create_workflow()
+    
+    def _create_data_retrieval_agent(self) -> AgentExecutor:
+        """Create the data retrieval agent with specialized tools"""
+        tools = [self.aws_tool, self.budget_tool, self.vendor_tool]
+        
+        # Create the agent prompt template
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are a specialized data retrieval agent for financial analysis. Your job is to intelligently retrieve and analyze financial data based on user queries.
+
+Available tools:
+- aws_data_retrieval: For AWS cost data analysis
+- budget_data_retrieval: For budget tracking and project spending
+- vendor_data_retrieval: For vendor spending and contract analysis
+
+When given a query:
+1. Determine which data source is most relevant
+2. Use the appropriate tool to retrieve data
+3. Provide a comprehensive analysis with key insights
+4. Identify any anomalies or unusual patterns
+5. Format the response clearly for further analysis
+
+Always be thorough and provide actionable insights from the data."""),
+            ("human", "{input}"),
+            MessagesPlaceholder(variable_name="agent_scratchpad"),
+        ])
+        
+        # Create the agent
+        agent = create_openai_functions_agent(
+            llm=self.llm,
+            tools=tools,
+            prompt=prompt
+        )
+        
+        return AgentExecutor(
+            agent=agent,
+            tools=tools,
+            verbose=True,
+            handle_parsing_errors=True
+        )
+    
+    def display_workflow_info(self):
+        """Display detailed information about the compiled workflow"""
+        print("\n" + "="*60)
+        print("🔧 DETAILED WORKFLOW INFORMATION")
+        print("="*60)
+        
+        # Basic workflow info
+        print(f"📊 Workflow Class: {self.workflow.__class__.__name__}")
+        print(f"🔗 Total Nodes: {len(self.workflow.nodes)}")
+        print(f"📝 Workflow Name: {self.workflow.name}")
+        
+        # Node details
+        print(f"\n📝 NODES:")
+        for node_name, node in self.workflow.nodes.items():
+            print(f"   • {node_name}: {node.__class__.__name__}")
+        
+        # Channel information
+        print(f"\n🔗 CHANNELS:")
+        print(f"   • Input Channel: {self.workflow.input_channels}")
+        print(f"   • Output Channels: {self.workflow.output_channels}")
+        print(f"   • Stream Channels: {self.workflow.stream_channels}")
+        
+        # Workflow configuration
+        print(f"\n⚙️ WORKFLOW CONFIGURATION:")
+        print(f"   • Entry Point: classify_question")
+        print(f"   • Flow: classify_question → retrieve_data (agent-based) → generate_answer → END")
+        print(f"   • State Management: WorkflowState with question, classification, relevant_data, final_answer")
+        print(f"   • Data Retrieval: Intelligent agent with specialized tools")
+        print(f"   • Debug Mode: {self.workflow.debug}")
+        
+        # Agent information
+        print(f"\n🤖 DATA RETRIEVAL AGENT:")
+        print(f"   • Agent Type: OpenAI Functions Agent")
+        print(f"   • Tools: {len([self.aws_tool, self.budget_tool, self.vendor_tool])} specialized tools")
+        print(f"   • Capabilities: Intelligent data selection, anomaly detection, trend analysis")
+        
+        print("="*60)
+    
+    def visualize_workflow(self, save_path: str = "workflow_graph.html"):
+        """Create a visual representation of the workflow graph using HTML"""
+        try:
+            from workflow_visualizer import WorkflowVisualizer
+            
+            # Use the visualizer module
+            result = WorkflowVisualizer.create_workflow_html(save_path)
+            
+            if result is None:
+                print("📊 Displaying text-based workflow structure instead:")
+                self._display_text_workflow()
+            
+            return result
+            
+        except ImportError:
+            print("\n⚠️  WorkflowVisualizer module not found. Using text-based display instead:")
+            self._display_text_workflow()
+        except Exception as e:
+            print(f"\n❌ Error creating visualization: {str(e)}")
+            print("📊 Displaying text-based workflow structure instead:")
+            self._display_text_workflow()
+    
+    def _display_text_workflow(self):
+        """Display a text-based representation of the workflow"""
+        try:
+            from workflow_visualizer import WorkflowVisualizer
+            WorkflowVisualizer.display_text_workflow()
+        except ImportError:
+            # Fallback to inline text display if module not available
+            print("\n" + "="*60)
+            print("📊 TEXT-BASED WORKFLOW STRUCTURE")
+            print("="*60)
+            
+            workflow_structure = """
+            START
+              ↓
+        ┌─────────────────┐
+        │ Classify        │ ← question
+        │ Question        │
+        └─────────────────┘
+              ↓
+        ┌─────────────────┐
+        │ Retrieve        │ ← classification
+        │ Data            │
+        └─────────────────┘
+              ↓
+        ┌─────────────────┐
+        │ Generate        │ ← relevant_data
+        │ Answer          │
+        └─────────────────┘
+              ↓
+             END
+            """
+            
+            print(workflow_structure)
+            print("="*60)
         
     def _create_workflow(self) -> StateGraph:
         """Create the LangGraph workflow"""
@@ -62,7 +411,18 @@ class SpendAnalyzerWorkflow:
         workflow.add_edge("retrieve_data", "generate_answer")
         workflow.add_edge("generate_answer", END)
         
-        return workflow.compile()
+        # Compile the workflow
+        compiled_workflow = workflow.compile()
+        
+        # Display workflow information
+        print("\n" + "="*60)
+        print("🔧 COMPILED WORKFLOW STRUCTURE")
+        print("="*60)
+        print(f"📊 Workflow Name: {compiled_workflow.__class__.__name__}")
+        print(f"🔗 Nodes: {list(compiled_workflow.nodes.keys())}")
+        print("="*60)
+        
+        return compiled_workflow
     
     def _classify_question(self, state: WorkflowState) -> WorkflowState:
         """Classify the user question into one of three categories"""
@@ -108,20 +468,46 @@ class SpendAnalyzerWorkflow:
             }
     
     def _retrieve_data(self, state: WorkflowState) -> WorkflowState:
-        """Retrieve relevant data based on the classification"""
-        
+        """Retrieve relevant data using the intelligent agent"""
         try:
-            classification = state['classification']
-            question = state['question']
+            question = state["question"]
+            classification = state["classification"]
             
-            if classification == "aws_costs":
-                relevant_data = self._retrieve_aws_data(question)
-            elif classification == "budget":
-                relevant_data = self._retrieve_budget_data(question)
-            elif classification == "vendor_spend":
-                relevant_data = self._retrieve_vendor_data(question)
+            # Create a context-aware query for the agent
+            agent_query = f"""
+Based on the classification '{classification}', please analyze the following question and retrieve relevant data:
+
+Question: {question}
+
+Please provide a comprehensive analysis including:
+1. Key metrics and statistics
+2. Anomaly detection
+3. Trends and patterns
+4. Business insights
+5. Recommendations
+
+Use the most appropriate data retrieval tools to gather comprehensive information.
+            """
+            
+            # Use the agent to retrieve and analyze data
+            agent_response = self.data_retrieval_agent.invoke({
+                "input": agent_query
+            })
+            
+            # Extract the agent's response
+            if "output" in agent_response:
+                relevant_data = {
+                    "agent_analysis": agent_response["output"],
+                    "classification": classification,
+                    "query": question,
+                    "data_retrieval_method": "intelligent_agent",
+                    "tools_used": [tool.name for tool in [self.aws_tool, self.budget_tool, self.vendor_tool]]
+                }
             else:
-                relevant_data = {"error": "Unknown classification"}
+                relevant_data = {
+                    "error": "Agent response format unexpected",
+                    "raw_response": agent_response
+                }
             
             return {
                 **state,
@@ -131,7 +517,7 @@ class SpendAnalyzerWorkflow:
         except Exception as e:
             return {
                 **state,
-                "relevant_data": {"error": f"Data retrieval error: {str(e)}"},
+                "relevant_data": {"error": f"Error in agent-based data retrieval: {str(e)}"},
                 "error": str(e)
             }
     
@@ -329,50 +715,98 @@ class SpendAnalyzerWorkflow:
             else:
                 # Create a detailed prompt for answer generation with full data access
                 answer_prompt = f"""
-                You are a senior financial analyst at a company. Analyze the data and answer the following question with a professional, executive-ready response. Report any unusual spikes or drops in the data.
-                
+                You are a senior financial analyst at a company. Analyze the data and answer the following question with a professional, executive-ready response. 
+                Your analysis must emphasize detecting, quantifying, and explaining anomalies (unusual spikes, drops, or outliers) along with their business implications. 
+
                 Question: {question}
                 Classification: {classification}
-                
+
                 **COMPLETE DATA ACCESS FOR ANALYSIS:**
-                
                 {self._format_complete_data_for_analysis(relevant_data)}
-                
+
                 **ANALYSIS REQUIREMENTS:**
-                
                 Please provide a comprehensive, professional answer that follows this structure:
-                
+
                 **EXECUTIVE SUMMARY**
-                - Brief 1-2 sentence overview of the key findings
-                
+                - 1–2 sentence overview of the key findings
+                - Explicitly mention if any anomalies were detected, their severity, and their overall significance
+
                 **DETAILED ANALYSIS**
                 - Present the specific data and metrics that answer the question
                 - Use exact numbers and percentages from the data
-                - **ANOMALY DETECTION**: Identify and explain any unusual spikes, drops, or patterns in the data
-                - Highlight trends, patterns, and data quality issues
-                - Compare current vs. historical data where available
-                
+                - **ANOMALY DETECTION**:
+                - Highlight unusual spikes, drops, or deviations from budget/historical baselines
+                - For each anomaly, provide:
+                    • Period / Vendor / Department (as applicable)  
+                    • Metric affected (e.g., Current Annual Spend, Budget Variance)  
+                    • Actual Value vs. Expected Value (or prior period)  
+                    • % Deviation from baseline  
+                    • **Severity Score**: High / Medium / Low, based on business impact  
+                - Separate **positive anomalies** (favorable variances) from **negative anomalies** (unfavorable variances)
+                - Highlight recurring trends, patterns, or data quality issues
+                - Compare current vs. historical/budgeted data to contextualize anomalies
+
                 **KEY INSIGHTS**
-                - 2-3 bullet points of the most important takeaways
-                - Business implications of the findings
-                - **ANOMALY IMPACT**: Business impact of any detected anomalies
-                
-                **RECOMMENDATIONS** (if applicable)
-                - Actionable next steps
-                - Risk mitigation strategies
-                - Optimization opportunities
-                - **ANOMALY RESPONSE**: Specific actions to address any detected anomalies
-                
+                - 2–3 concise bullet points with the most important takeaways
+                - **ANOMALY INSIGHTS**:
+                - List the anomalies with severity scores and explain business implications
+                - Call out the most critical anomaly and its potential root cause
+
+                **RECOMMENDATIONS**
+                - Actionable next steps tied directly to findings
+                - Risk mitigation strategies for negative anomalies
+                - Optimization opportunities from positive anomalies
+                - **ANOMALY RESPONSE**:
+                - For each anomaly (especially High severity), suggest specific actions to investigate, resolve, or capitalize on the finding
+
+                **ANOMALY DATA RETURN**
+                Return a structured anomaly table with the following columns:
+                - Row/Period Identifier
+                - Metric
+                - Actual Value
+                - Expected Value / Benchmark
+                - % Deviation
+                - Severity Score
+                - Business Impact (1–2 sentence explanation)
+
+                **EXAMPLES**
+
+                Example 1 — Executive Summary:
+                - "Q2 AWS cloud spend exceeded the approved budget by 65%, representing a High severity anomaly. While other vendors remained within budget, this deviation poses significant cost overrun risk."
+
+                Example 2 — Anomaly Data Return Table:
+
+                | Period   | Metric               | Actual Value | Expected Value | % Deviation | Severity Score | Business Impact |
+                |----------|----------------------|--------------|----------------|-------------|----------------|-----------------|
+                | Q2-2025  | AWS Current Spend    | $850,000     | $515,000       | +65%        | High           | Significant overspend vs. budget; may impact EBITDA if not corrected. |
+                | Q1-2025  | Salesforce Variance  | +$25,000     | $0             | +12%        | Low            | Slight overage within tolerance, but trend should be monitored. |
+                | Q4-2024  | GCP Current Spend    | $120,000     | $240,000       | -50%        | Medium         | Underutilization of reserved instances; potential efficiency issue. |
+
+                Example 3 — Key Insights:
+                - AWS costs surged in Q2-2025, exceeding budget by 65% (High severity anomaly).  
+                - GCP spend dropped by 50% in Q4-2024, suggesting underutilization (Medium severity).  
+                - Salesforce spend slightly over budget (+12%), not critical but worth monitoring (Low severity).  
+
+                Example 4 — Recommendations:
+                - Immediately review AWS workloads to identify drivers of overspend and implement cost-control measures.  
+                - Reassess GCP commitments to optimize reserved instance utilization.  
+                - Track Salesforce license allocations to prevent creeping overspend.  
+
                 **DATA SOURCES & QUALITY**
                 - Reference the datasets used for this analysis
-                - Note any data quality issues or missing information
-                - Confidence level in the analysis based on data completeness
-                
-                **IMPORTANT**: Analyze the complete data structure provided above to identify any anomalies, outliers, or unusual patterns. Use statistical analysis where appropriate to detect significant deviations from normal patterns.
-                Do not make up any data or use any data that is not provided in the data structure.
-                Format your response professionally with clear headings, bullet points, and proper spacing. Use business language appropriate for executive stakeholders.
-                
+                - Note any missing, incomplete, or inconsistent data
+                - Confidence level in the analysis based on completeness and reliability of the dataset
+
+                **IMPORTANT INSTRUCTIONS:**
+                - Analyze the complete dataset provided above
+                - Always return anomalies with their details and severity scores
+                - Use quantitative evidence (numbers and % variances) to justify anomalies
+                - Clearly call out the business impact of each anomaly
+                - Do not fabricate data or reference anything outside the provided dataset
+                - Format your response with professional, executive-ready structure, clear headings, and bullet points
+
                 Answer:
+
                 """
                 
                 response = self.llm.invoke([

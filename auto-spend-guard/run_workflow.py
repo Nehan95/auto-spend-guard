@@ -61,6 +61,16 @@ def main():
         workflow = SpendAnalyzerWorkflow()
         print("✅ Workflow initialized successfully!")
         
+        # Display workflow information
+        workflow.display_workflow_info()
+        
+        # Create workflow visualization (optional)
+        print("\n🎨 Creating workflow visualization...")
+        try:
+            workflow.visualize_workflow("workflow_visualization.html")
+        except Exception as e:
+            print(f"⚠️  Visualization creation skipped: {str(e)}")
+        
         print(f"\n📊 Loaded {len(workflow.data_loader.get_available_datasets())} datasets:")
         for dataset in workflow.data_loader.get_available_datasets():
             info = workflow.data_loader.get_dataframe_info(dataset)
