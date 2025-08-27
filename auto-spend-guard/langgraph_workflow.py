@@ -9,6 +9,8 @@ import pandas as pd
 from dataloader import DataLoader
 import os
 from dotenv import load_dotenv
+import time
+from datetime import datetime
 
 # Load environment variables
 load_dotenv()
@@ -20,6 +22,7 @@ class WorkflowState(TypedDict):
     relevant_data: Dict[str, Any]
     final_answer: str
     error: str
+    latency_metrics: Dict[str, Any]
 
 # Data Retrieval Tools
 class DataRetrievalTool(BaseTool):
@@ -230,8 +233,8 @@ class SpendAnalyzerWorkflow:
     
     def __init__(self):
         self.llm = ChatOpenAI(
-            model="gpt-3.5-turbo",
-            temperature=0,
+            model="gpt-4o-mini",
+            temperature=0.6,
             api_key=os.getenv("OPENAI_API_KEY")
         )
         
@@ -330,8 +333,14 @@ Always be thorough and provide actionable insights from the data."""),
         # Agent information
         print(f"\n🤖 DATA RETRIEVAL AGENT:")
         print(f"   • Agent Type: OpenAI Functions Agent")
-        print(f"   • Tools: {len([self.aws_tool, self.budget_tool, self.vendor_tool])} specialized tools")
+        print(f"   • Tools: {len([self.aws_tool, self.aws_tool, self.vendor_tool])} specialized tools")
         print(f"   • Capabilities: Intelligent data selection, anomaly detection, trend analysis")
+        
+        # Performance monitoring
+        print(f"\n⚡ PERFORMANCE MONITORING:")
+        print(f"   • Latency Tracking: Enabled for all workflow steps")
+        print(f"   • Metrics: Question classification, data retrieval, response generation")
+        print(f"   • Granularity: LLM vs. overhead timing breakdown")
         
         print("="*60)
     
@@ -391,7 +400,82 @@ Always be thorough and provide actionable insights from the data."""),
             
             print(workflow_structure)
             print("="*60)
+    
+    def display_latency_metrics(self, state: WorkflowState = None):
+        """Display latency metrics for workflow performance analysis"""
+        if state is None or "latency_metrics" not in state:
+            print("\n📊 No latency metrics available. Run the workflow first to see performance data.")
+            return
         
+        print("\n" + "="*60)
+        print("⚡ LATENCY METRICS & PERFORMANCE ANALYSIS")
+        print("="*60)
+        
+        latency_metrics = state["latency_metrics"]
+        
+        # Question Classification Metrics
+        if "question_classification" in latency_metrics:
+            qc_metrics = latency_metrics["question_classification"]
+            print(f"\n🔍 QUESTION CLASSIFICATION:")
+            print(f"   • Total Duration: {qc_metrics.get('total_duration_seconds', 0)}s")
+            print(f"   • LLM Duration: {qc_metrics.get('llm_duration_seconds', 0)}s")
+            print(f"   • Overhead: {qc_metrics.get('overhead_duration_seconds', 0)}s")
+            print(f"   • Status: {qc_metrics.get('status', 'unknown')}")
+        
+        # Data Retrieval Metrics
+        if "data_retrieval" in latency_metrics:
+            dr_metrics = latency_metrics["data_retrieval"]
+            print(f"\n🔍 DATA RETRIEVAL:")
+            print(f"   • Total Duration: {dr_metrics.get('total_duration_seconds', 0)}s")
+            print(f"   • Agent Duration: {dr_metrics.get('agent_duration_seconds', 0)}s")
+            print(f"   • Overhead: {dr_metrics.get('overhead_duration_seconds', 0)}s")
+            print(f"   • Status: {dr_metrics.get('status', 'unknown')}")
+            if "retrieval_metadata" in state.get("relevant_data", {}):
+                metadata = state["relevant_data"]["retrieval_metadata"]
+                print(f"   • Response Length: {metadata.get('response_length', 0)} characters")
+                print(f"   • Tools Executed: {metadata.get('tools_executed', 0)}")
+        
+        # Response Generation Metrics
+        if "response_generation" in latency_metrics:
+            rg_metrics = latency_metrics["response_generation"]
+            print(f"\n🔍 RESPONSE GENERATION:")
+            print(f"   • Total Duration: {rg_metrics.get('total_duration_seconds', 0)}s")
+            print(f"   • LLM Duration: {rg_metrics.get('llm_duration_seconds', 0)}s")
+            print(f"   • Overhead: {rg_metrics.get('overhead_duration_seconds', 0)}s")
+            print(f"   • Response Length: {rg_metrics.get('response_length', 0)} characters")
+            print(f"   • Status: {rg_metrics.get('status', 'unknown')}")
+        
+        # Performance Summary
+        total_duration = sum([
+            latency_metrics.get("question_classification", {}).get("total_duration_seconds", 0),
+            latency_metrics.get("data_retrieval", {}).get("total_duration_seconds", 0),
+            latency_metrics.get("response_generation", {}).get("total_duration_seconds", 0)
+        ])
+        
+        print(f"\n📈 PERFORMANCE SUMMARY:")
+        print(f"   • Total Workflow Duration: {total_duration:.3f}s")
+        
+        # Calculate LLM operations time
+        llm_ops_time = sum([
+            latency_metrics.get("question_classification", {}).get("llm_duration_seconds", 0),
+            latency_metrics.get("response_generation", {}).get("llm_duration_seconds", 0)
+        ])
+        print(f"   • LLM Operations: {llm_ops_time:.3f}s")
+        
+        # Calculate agent operations time
+        agent_ops_time = latency_metrics.get('data_retrieval', {}).get('agent_duration_seconds', 0)
+        print(f"   • Agent Operations: {agent_ops_time:.3f}s")
+        
+        # Calculate system overhead time
+        system_overhead = sum([
+            latency_metrics.get("question_classification", {}).get("overhead_duration_seconds", 0),
+            latency_metrics.get("data_retrieval", {}).get("overhead_duration_seconds", 0),
+            latency_metrics.get("response_generation", {}).get("overhead_duration_seconds", 0)
+        ])
+        print(f"   • System Overhead: {system_overhead:.3f}s")
+        
+        print("="*60)
+    
     def _create_workflow(self) -> StateGraph:
         """Create the LangGraph workflow"""
         
@@ -425,7 +509,9 @@ Always be thorough and provide actionable insights from the data."""),
         return compiled_workflow
     
     def _classify_question(self, state: WorkflowState) -> WorkflowState:
-        """Classify the user question into one of three categories"""
+        """Classify the user question into one of three categories with latency tracking"""
+        start_time = time.time()
+        classification_start = datetime.now()
         
         classification_prompt = f"""
         You are a financial data analyst specializing in company spending analysis. Your task is to classify the following question into exactly one of these three categories:
@@ -442,10 +528,14 @@ Always be thorough and provide actionable insights from the data."""),
         """
         
         try:
+            # Track LLM classification time
+            llm_start = time.time()
             response = self.llm.invoke([
                 self.system_message,
                 HumanMessage(content=classification_prompt)
             ])
+            llm_duration = time.time() - llm_start
+            
             classification = response.content.strip().lower()
             
             # Validate classification
@@ -455,20 +545,56 @@ Always be thorough and provide actionable insights from the data."""),
                 
             print(f"Question classified as: {classification}")
             
+            total_duration = time.time() - start_time
+            classification_end = datetime.now()
+            
+            # Update latency metrics
+            latency_metrics = {
+                "question_classification": {
+                    "start_time": classification_start.isoformat(),
+                    "end_time": classification_end.isoformat(),
+                    "total_duration_seconds": round(total_duration, 3),
+                    "llm_duration_seconds": round(llm_duration, 3),
+                    "overhead_duration_seconds": round(total_duration - llm_duration, 3),
+                    "status": "success"
+                }
+            }
+            
             return {
                 **state,
-                "classification": classification
+                "classification": classification,
+                "latency_metrics": latency_metrics
             }
             
         except Exception as e:
+            total_duration = time.time() - start_time
+            classification_end = datetime.now()
+            
+            # Update latency metrics with error
+            latency_metrics = {
+                "question_classification": {
+                    "start_time": classification_start.isoformat(),
+                    "end_time": classification_end.isoformat(),
+                    "total_duration_seconds": round(total_duration, 3),
+                    "llm_duration_seconds": 0,
+                    "overhead_duration_seconds": round(total_duration, 3),
+                    "status": "error",
+                    "error_message": str(e)
+                }
+            }
+            
             return {
                 **state,
                 "classification": "budget",  # Default fallback
-                "error": f"Classification error: {str(e)}"
+                "error": f"Classification error: {str(e)}",
+                "latency_metrics": latency_metrics
             }
     
     def _retrieve_data(self, state: WorkflowState) -> WorkflowState:
-        """Retrieve relevant data using the intelligent agent"""
+        """Retrieve relevant data using the intelligent agent with latency tracking"""
+        start_time = time.time()
+        retrieval_start = datetime.now()
+        
         try:
             question = state["question"]
             classification = state["classification"]
@@ -489,10 +615,12 @@ Please provide a comprehensive analysis including:
 Use the most appropriate data retrieval tools to gather comprehensive information.
             """
             
-            # Use the agent to retrieve and analyze data
+            # Track agent invocation time
+            agent_start = time.time()
             agent_response = self.data_retrieval_agent.invoke({
                 "input": agent_query
             })
+            agent_duration = time.time() - agent_start
             
             # Extract the agent's response
             if "output" in agent_response:
@@ -501,24 +629,69 @@ Use the most appropriate data retrieval tools to gather comprehensive informatio
                     "classification": classification,
                     "query": question,
                     "data_retrieval_method": "intelligent_agent",
-                    "tools_used": [tool.name for tool in [self.aws_tool, self.budget_tool, self.vendor_tool]]
+                    "tools_used": [tool.name for tool in [self.aws_tool, self.budget_tool, self.vendor_tool]],
+                    "retrieval_metadata": {
+                        "agent_duration_seconds": round(agent_duration, 3),
+                        "response_length": len(agent_response["output"]),
+                        "tools_executed": len([tool.name for tool in [self.aws_tool, self.budget_tool, self.vendor_tool]])
+                    }
                 }
             else:
                 relevant_data = {
                     "error": "Agent response format unexpected",
-                    "raw_response": agent_response
+                    "raw_response": agent_response,
+                    "retrieval_metadata": {
+                        "agent_duration_seconds": round(agent_duration, 3),
+                        "response_length": 0,
+                        "tools_executed": 0
+                    }
                 }
+            
+            total_duration = time.time() - start_time
+            retrieval_end = datetime.now()
+            
+            # Update latency metrics
+            latency_metrics = state.get("latency_metrics", {})
+            latency_metrics.update({
+                "data_retrieval": {
+                    "start_time": retrieval_start.isoformat(),
+                    "end_time": retrieval_end.isoformat(),
+                    "total_duration_seconds": round(total_duration, 3),
+                    "agent_duration_seconds": round(agent_duration, 3),
+                    "overhead_duration_seconds": round(total_duration - agent_duration, 3),
+                    "status": "success"
+                }
+            })
             
             return {
                 **state,
-                "relevant_data": relevant_data
+                "relevant_data": relevant_data,
+                "latency_metrics": latency_metrics
             }
             
         except Exception as e:
+            total_duration = time.time() - start_time
+            retrieval_end = datetime.now()
+            
+            # Update latency metrics with error
+            latency_metrics = state.get("latency_metrics", {})
+            latency_metrics.update({
+                "data_retrieval": {
+                    "start_time": retrieval_start.isoformat(),
+                    "end_time": retrieval_end.isoformat(),
+                    "total_duration_seconds": round(total_duration, 3),
+                    "agent_duration_seconds": 0,
+                    "overhead_duration_seconds": round(total_duration, 3),
+                    "status": "error",
+                    "error_message": str(e)
+                }
+            })
+            
             return {
                 **state,
                 "relevant_data": {"error": f"Error in agent-based data retrieval: {str(e)}"},
-                "error": str(e)
+                "error": str(e),
+                "latency_metrics": latency_metrics
             }
     
     def _retrieve_aws_data(self, question: str) -> Dict[str, Any]:
@@ -703,7 +876,9 @@ Use the most appropriate data retrieval tools to gather comprehensive informatio
             return {"error": f"Error retrieving vendor data: {str(e)}"}
     
     def _generate_answer(self, state: WorkflowState) -> WorkflowState:
-        """Generate a comprehensive answer based on retrieved data"""
+        """Generate a comprehensive answer based on retrieved data with latency tracking"""
+        start_time = time.time()
+        generation_start = datetime.now()
         
         try:
             question = state['question']
@@ -712,6 +887,28 @@ Use the most appropriate data retrieval tools to gather comprehensive informatio
             
             if 'error' in relevant_data:
                 answer = f"Error retrieving data: {relevant_data['error']}"
+                total_duration = time.time() - start_time
+                generation_end = datetime.now()
+                
+                # Update latency metrics for error case
+                latency_metrics = state.get("latency_metrics", {})
+                latency_metrics.update({
+                    "response_generation": {
+                        "start_time": generation_start.isoformat(),
+                        "end_time": generation_end.isoformat(),
+                        "total_duration_seconds": round(total_duration, 3),
+                        "llm_duration_seconds": 0,
+                        "overhead_duration_seconds": round(total_duration, 3),
+                        "response_length": len(answer),
+                        "status": "error_skip_llm"
+                    }
+                })
+                
+                return {
+                    **state,
+                    "final_answer": answer,
+                    "latency_metrics": latency_metrics
+                }
             else:
                 # Create a detailed prompt for answer generation with full data access
                 answer_prompt = f"""
@@ -780,10 +977,6 @@ Use the most appropriate data retrieval tools to gather comprehensive informatio
                 |----------|----------------------|--------------|----------------|-------------|----------------|-----------------|
                 | Q2-2025  | AWS Current Spend    | $850,000     | $515,000       | +65%        | High           | Significant overspend vs. budget; may impact EBITDA if not corrected. |
                 | Q1-2025  | Salesforce Variance  | +$25,000     | $0             | +12%        | Low            | Slight overage within tolerance, but trend should be monitored. |
-                | Q4-2024  | GCP Current Spend    | $120,000     | $240,000       | -50%        | Medium         | Underutilization of reserved instances; potential efficiency issue. |
-
-                Example 3 — Key Insights:
-                - AWS costs surged in Q2-2025, exceeding budget by 65% (High severity anomaly).  
                 - GCP spend dropped by 50% in Q4-2024, suggesting underutilization (Medium severity).  
                 - Salesforce spend slightly over budget (+12%), not critical but worth monitoring (Low severity).  
 
@@ -809,22 +1002,62 @@ Use the most appropriate data retrieval tools to gather comprehensive informatio
 
                 """
                 
+                # Track LLM generation time
+                llm_start = time.time()
                 response = self.llm.invoke([
                     self.system_message,
                     HumanMessage(content=answer_prompt)
                 ])
+                llm_duration = time.time() - llm_start
+                
                 answer = response.content.strip()
-            
-            return {
-                **state,
-                "final_answer": answer
-            }
+                total_duration = time.time() - start_time
+                generation_end = datetime.now()
+                
+                # Update latency metrics
+                latency_metrics = state.get("latency_metrics", {})
+                latency_metrics.update({
+                    "response_generation": {
+                        "start_time": generation_start.isoformat(),
+                        "end_time": generation_end.isoformat(),
+                        "total_duration_seconds": round(total_duration, 3),
+                        "llm_duration_seconds": round(llm_duration, 3),
+                        "overhead_duration_seconds": round(total_duration - llm_duration, 3),
+                        "response_length": len(answer),
+                        "status": "success"
+                    }
+                })
+                
+                return {
+                    **state,
+                    "final_answer": answer,
+                    "latency_metrics": latency_metrics
+                }
             
         except Exception as e:
+            total_duration = time.time() - start_time
+            generation_end = datetime.now()
+            
+            # Update latency metrics with error
+            latency_metrics = state.get("latency_metrics", {})
+            latency_metrics.update({
+                "response_generation": {
+                    "start_time": generation_start.isoformat(),
+                    "end_time": generation_end.isoformat(),
+                    "total_duration_seconds": round(total_duration, 3),
+                    "llm_duration_seconds": 0,
+                    "overhead_duration_seconds": round(total_duration, 3),
+                    "response_length": 0,
+                    "status": "error",
+                    "error_message": str(e)
+                }
+            })
+            
             return {
                 **state,
                 "final_answer": f"Error generating answer: {str(e)}",
-                "error": str(e)
+                "error": str(e),
+                "latency_metrics": latency_metrics
             }
     
     def _format_data_for_prompt(self, data: Dict[str, Any]) -> str:
