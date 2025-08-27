@@ -11,6 +11,7 @@ import os
 from dotenv import load_dotenv
 import time
 from datetime import datetime
+import tiktoken
 
 # Load environment variables
 load_dotenv()
@@ -339,8 +340,10 @@ Always be thorough and provide actionable insights from the data."""),
         # Performance monitoring
         print(f"\n⚡ PERFORMANCE MONITORING:")
         print(f"   • Latency Tracking: Enabled for all workflow steps")
+        print(f"   • Token Counting: Input/output token tracking for all LLM calls")
         print(f"   • Metrics: Question classification, data retrieval, response generation")
         print(f"   • Granularity: LLM vs. overhead timing breakdown")
+        print(f"   • Cost Estimation: GPT-3.5-turbo pricing calculations")
         
         print("="*60)
     
@@ -420,6 +423,9 @@ Always be thorough and provide actionable insights from the data."""),
             print(f"   • Total Duration: {qc_metrics.get('total_duration_seconds', 0)}s")
             print(f"   • LLM Duration: {qc_metrics.get('llm_duration_seconds', 0)}s")
             print(f"   • Overhead: {qc_metrics.get('overhead_duration_seconds', 0)}s")
+            print(f"   • Input Tokens: {qc_metrics.get('input_tokens', 0)}")
+            print(f"   • Output Tokens: {qc_metrics.get('output_tokens', 0)}")
+            print(f"   • Total Tokens: {qc_metrics.get('total_tokens', 0)}")
             print(f"   • Status: {qc_metrics.get('status', 'unknown')}")
         
         # Data Retrieval Metrics
@@ -443,6 +449,9 @@ Always be thorough and provide actionable insights from the data."""),
             print(f"   • LLM Duration: {rg_metrics.get('llm_duration_seconds', 0)}s")
             print(f"   • Overhead: {rg_metrics.get('overhead_duration_seconds', 0)}s")
             print(f"   • Response Length: {rg_metrics.get('response_length', 0)} characters")
+            print(f"   • Input Tokens: {rg_metrics.get('input_tokens', 0)}")
+            print(f"   • Output Tokens: {rg_metrics.get('output_tokens', 0)}")
+            print(f"   • Total Tokens: {rg_metrics.get('total_tokens', 0)}")
             print(f"   • Status: {rg_metrics.get('status', 'unknown')}")
         
         # Performance Summary
@@ -474,7 +483,36 @@ Always be thorough and provide actionable insights from the data."""),
         ])
         print(f"   • System Overhead: {system_overhead:.3f}s")
         
+        # Calculate total token usage
+        total_input_tokens = sum([
+            latency_metrics.get("question_classification", {}).get("input_tokens", 0),
+            latency_metrics.get("response_generation", {}).get("input_tokens", 0)
+        ])
+        total_output_tokens = sum([
+            latency_metrics.get("question_classification", {}).get("output_tokens", 0),
+            latency_metrics.get("response_generation", {}).get("output_tokens", 0)
+        ])
+        total_tokens = total_input_tokens + total_output_tokens
+        
+        print(f"\n🔤 TOKEN USAGE SUMMARY:")
+        print(f"   • Total Input Tokens: {total_input_tokens}")
+        print(f"   • Total Output Tokens: {total_output_tokens}")
+        print(f"   • Total Tokens: {total_tokens}")
+        print(f"   • Estimated Cost (GPT-3.5-turbo): ${(total_tokens * 0.000002):.4f}")
+        
         print("="*60)
+    
+    def _count_tokens(self, text: str, model: str = "gpt-3.5-turbo") -> int:
+        """Count tokens in text for the specified model"""
+        try:
+            # Use tiktoken to count tokens
+            encoding = tiktoken.encoding_for_model(model)
+            tokens = encoding.encode(text)
+            return len(tokens)
+        except Exception as e:
+            # Fallback to approximate counting if tiktoken fails
+            # Rough approximation: 1 token ≈ 4 characters for English text
+            return len(text) // 4
     
     def _create_workflow(self) -> StateGraph:
         """Create the LangGraph workflow"""
@@ -528,13 +566,21 @@ Always be thorough and provide actionable insights from the data."""),
         """
         
         try:
-            # Track LLM classification time
+            # Track LLM classification time and tokens
             llm_start = time.time()
+            
+            # Count input tokens
+            input_text = f"{self.system_message.content}\n{classification_prompt}"
+            input_tokens = self._count_tokens(input_text)
+            
             response = self.llm.invoke([
                 self.system_message,
                 HumanMessage(content=classification_prompt)
             ])
             llm_duration = time.time() - llm_start
+            
+            # Count output tokens
+            output_tokens = self._count_tokens(response.content)
             
             classification = response.content.strip().lower()
             
@@ -548,7 +594,7 @@ Always be thorough and provide actionable insights from the data."""),
             total_duration = time.time() - start_time
             classification_end = datetime.now()
             
-            # Update latency metrics
+            # Update latency metrics with token information
             latency_metrics = {
                 "question_classification": {
                     "start_time": classification_start.isoformat(),
@@ -556,6 +602,9 @@ Always be thorough and provide actionable insights from the data."""),
                     "total_duration_seconds": round(total_duration, 3),
                     "llm_duration_seconds": round(llm_duration, 3),
                     "overhead_duration_seconds": round(total_duration - llm_duration, 3),
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens,
                     "status": "success"
                 }
             }
@@ -1002,19 +1051,27 @@ Use the most appropriate data retrieval tools to gather comprehensive informatio
 
                 """
                 
-                # Track LLM generation time
+                # Track LLM generation time and tokens
                 llm_start = time.time()
+                
+                # Count input tokens
+                input_text = f"{self.system_message.content}\n{answer_prompt}"
+                input_tokens = self._count_tokens(input_text)
+                
                 response = self.llm.invoke([
                     self.system_message,
                     HumanMessage(content=answer_prompt)
                 ])
                 llm_duration = time.time() - llm_start
                 
+                # Count output tokens
+                output_tokens = self._count_tokens(response.content)
+                
                 answer = response.content.strip()
                 total_duration = time.time() - start_time
                 generation_end = datetime.now()
                 
-                # Update latency metrics
+                # Update latency metrics with token information
                 latency_metrics = state.get("latency_metrics", {})
                 latency_metrics.update({
                     "response_generation": {
@@ -1024,6 +1081,9 @@ Use the most appropriate data retrieval tools to gather comprehensive informatio
                         "llm_duration_seconds": round(llm_duration, 3),
                         "overhead_duration_seconds": round(total_duration - llm_duration, 3),
                         "response_length": len(answer),
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": input_tokens + output_tokens,
                         "status": "success"
                     }
                 })
