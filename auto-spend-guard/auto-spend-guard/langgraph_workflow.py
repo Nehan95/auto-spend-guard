@@ -24,6 +24,8 @@ class WorkflowState(TypedDict):
     final_answer: str
     error: str
     latency_metrics: Dict[str, Any]
+    messages: List[BaseMessage]  # Message state for tracking tools
+    tools_used: List[str]  # Track which tools were executed
 
 # Data Retrieval Tools
 class DataRetrievalTool(BaseTool):
@@ -37,6 +39,122 @@ class DataRetrievalTool(BaseTool):
     
     async def _arun(self, query: str, **kwargs) -> str:
         raise NotImplementedError("Subclasses must implement _arun")
+
+class RetrieverAgent:
+    """Intelligent agent for routing classification responses to specific tools and retrieving relevant data"""
+    
+    def __init__(self, llm: ChatOpenAI, tools: List[DataRetrievalTool]):
+        self.llm = llm
+        self.tools = {tool.name: tool for tool in tools}
+        self.tool_descriptions = {tool.name: tool.description for tool in tools}
+        
+        # Create the retriever prompt template
+        self.retriever_prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are an intelligent data retrieval agent that routes user queries to the most appropriate tools based on classification and context.
+
+Available tools:
+{tool_descriptions}
+
+Your task is to:
+1. Analyze the user's question and its classification
+2. Determine which tool(s) are most relevant
+3. Execute the appropriate tool(s) to retrieve data
+4. Return comprehensive, relevant data with analysis
+
+Guidelines:
+- Use the classification to guide tool selection
+- Consider the specific context and requirements of the question
+- Execute tools efficiently and return structured data
+- Provide insights and analysis based on the retrieved data
+- Handle cases where multiple tools might be relevant
+
+Always return data in a structured format that includes:
+- Data source and tool used
+- Key metrics and insights
+- Anomaly detection
+- Business implications
+- Recommendations"""),
+            ("human", "Question: {question}\nClassification: {classification}\n\nPlease retrieve relevant data using the most appropriate tools."),
+            MessagesPlaceholder(variable_name="agent_scratchpad"),
+        ])
+        
+        # Create the agent
+        self.agent = create_openai_functions_agent(
+            llm=self.llm,
+            tools=list(tools),
+            prompt=self.retriever_prompt
+        )
+        
+        self.agent_executor = AgentExecutor(
+            agent=self.agent,
+            tools=list(tools),
+            verbose=True,
+            handle_parsing_errors=True
+        )
+    
+    def retrieve_data(self, question: str, classification: str) -> Dict[str, Any]:
+        """Retrieve relevant data using intelligent tool routing"""
+        try:
+            # Format tool descriptions for the prompt
+            tool_descriptions = []
+            for name, description in self.tool_descriptions.items():
+                tool_descriptions.append(f"- {name}: {description}")
+            
+            tool_descriptions_text = "\n".join(tool_descriptions)
+            
+            # Execute the agent
+            response = self.agent_executor.invoke({
+                "question": question,
+                "classification": classification,
+                "tool_descriptions": tool_descriptions_text
+            })
+            
+            # Extract the response
+            if "output" in response:
+                return {
+                    "success": True,
+                    "data": response["output"],
+                    "tool_execution": response.get("intermediate_steps", []),
+                    "agent_response": response
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": "Unexpected agent response format",
+                    "raw_response": response
+                }
+                
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Error in retriever agent: {str(e)}",
+                "exception": str(e)
+            }
+    
+    def get_tool_usage_summary(self, tool_execution: List) -> Dict[str, Any]:
+        """Extract tool usage summary from agent execution"""
+        if not tool_execution:
+            return {}
+        
+        tool_summary = {}
+        for step in tool_execution:
+            if len(step) >= 2:
+                tool_name = step[0].tool if hasattr(step[0], 'tool') else str(step[0])
+                tool_input = step[0].tool_input if hasattr(step[0], 'tool_input') else str(step[0])
+                tool_output = step[1] if len(step) > 1 else "No output"
+                
+                if tool_name not in tool_summary:
+                    tool_summary[tool_name] = {
+                        "executions": 0,
+                        "inputs": [],
+                        "outputs": []
+                    }
+                
+                tool_summary[tool_name]["executions"] += 1
+                tool_summary[tool_name]["inputs"].append(tool_input)
+                tool_summary[tool_name]["outputs"].append(tool_output)
+        
+        return tool_summary
 
 class AWSDataRetrievalTool(DataRetrievalTool):
     """Tool for retrieving AWS cost data"""
@@ -256,7 +374,13 @@ class SpendAnalyzerWorkflow:
         self.budget_tool = BudgetDataRetrievalTool(self.data_loader)
         self.vendor_tool = VendorDataRetrievalTool(self.data_loader)
         
-        # Create the data retrieval agent
+        # Create the retriever agent
+        self.retriever_agent = RetrieverAgent(
+            self.llm, 
+            [self.aws_tool, self.budget_tool, self.vendor_tool]
+        )
+        
+        # Create the data retrieval agent (kept for backward compatibility)
         self.data_retrieval_agent = self._create_data_retrieval_agent()
         
         # Create the workflow graph
@@ -326,33 +450,51 @@ Always be thorough and provide actionable insights from the data."""),
         # Workflow configuration
         print(f"\n⚙️ WORKFLOW CONFIGURATION:")
         print(f"   • Entry Point: classify_question")
-        print(f"   • Flow: classify_question → retrieve_data (agent-based) → generate_answer → END")
-        print(f"   • State Management: WorkflowState with question, classification, relevant_data, final_answer")
-        print(f"   • Data Retrieval: Intelligent agent with specialized tools")
+        print(f"   • Flow: classify_question → conditional routing → specific data retrieval → generate_answer → END")
+        print(f"   • Conditional Routing: Based on question classification (aws_costs, budget, vendor_spend)")
+        print(f"   • State Management: WorkflowState with question, classification, relevant_data, final_answer, messages, tools_used")
+        print(f"   • Data Retrieval: Direct tool execution based on classification")
         print(f"   • Debug Mode: {self.workflow.debug}")
         
-        # Agent information
-        print(f"\n🤖 DATA RETRIEVAL AGENT:")
-        print(f"   • Agent Type: OpenAI Functions Agent")
-        print(f"   • Tools: {len([self.aws_tool, self.aws_tool, self.vendor_tool])} specialized tools")
-        print(f"   • Capabilities: Intelligent data selection, anomaly detection, trend analysis")
+        # Tool information
+        print(f"\n🔧 DATA RETRIEVAL TOOLS:")
+        print(f"   • AWS Tool: {self.aws_tool.name} - {self.aws_tool.description}")
+        print(f"   • Budget Tool: {self.budget_tool.name} - {self.budget_tool.description}")
+        print(f"   • Vendor Tool: {self.vendor_tool.name} - {self.vendor_tool.description}")
+        print(f"   • Tool Selection: Automatic based on question classification")
+        
+        # Retriever agent information
+        print(f"\n🤖 RETRIEVER AGENT:")
+        print(f"   • Agent Type: OpenAI Functions Agent with Intelligent Routing")
+        print(f"   • Capabilities: Classification-based tool routing, intelligent data retrieval")
+        print(f"   • Fallback Strategy: Direct tool execution if agent fails")
+        print(f"   • Tool Integration: Seamless integration with all data retrieval tools")
+        print(f"   • Context Awareness: Uses question context and classification for optimal tool selection")
+        
+        # Message state and tool tracking
+        print(f"\n💬 MESSAGE STATE & TOOL TRACKING:")
+        print(f"   • Message State: Enabled for tracking workflow progression")
+        print(f"   • Tool Usage Tracking: Records which tools were executed")
+        print(f"   • Workflow History: Complete message trail from start to finish")
+        print(f"   • Performance Metrics: Tool execution times and response lengths")
+        print(f"   • Agent Execution Tracking: Retriever agent performance and tool routing decisions")
         
         # Performance monitoring
         print(f"\n⚡ PERFORMANCE MONITORING:")
         print(f"   • Latency Tracking: Enabled for all workflow steps")
         print(f"   • Token Counting: Input/output token tracking for all LLM calls")
-        print(f"   • Metrics: Question classification, data retrieval, response generation")
-        print(f"   • Granularity: LLM vs. overhead timing breakdown")
-        print(f"   • Cost Estimation: GPT-3.5-turbo pricing calculations")
+        print(f"   • Metrics: Question classification, tool execution, response generation")
+        print(f"   • Granularity: Tool vs. overhead timing breakdown")
+        print(f"   • Cost Estimation: GPT-4o-mini pricing calculations")
         
         print("="*60)
     
-    def visualize_workflow(self, save_path: str = "workflow_graph.html"):
-        """Create a visual representation of the workflow graph using HTML"""
+    def visualize_workflow(self, save_path: str = "enhanced_workflow_graph.html"):
+        """Create a visual representation of the enhanced workflow graph using HTML"""
         try:
             from workflow_visualizer import WorkflowVisualizer
             
-            # Use the visualizer module
+            # Use the enhanced visualizer module
             result = WorkflowVisualizer.create_workflow_html(save_path)
             
             if result is None:
@@ -370,31 +512,41 @@ Always be thorough and provide actionable insights from the data."""),
             self._display_text_workflow()
     
     def _display_text_workflow(self):
-        """Display a text-based representation of the workflow"""
+        """Display a text-based representation of the enhanced workflow"""
         try:
             from workflow_visualizer import WorkflowVisualizer
             WorkflowVisualizer.display_text_workflow()
         except ImportError:
             # Fallback to inline text display if module not available
-            print("\n" + "="*60)
-            print("📊 TEXT-BASED WORKFLOW STRUCTURE")
-            print("="*60)
+            print("\n" + "="*80)
+            print("🚀 ENHANCED AUTO-SPEND WORKFLOW WITH RETRIEVER AGENT")
+            print("="*80)
             
             workflow_structure = """
             START
               ↓
         ┌─────────────────┐
-        │ Classify        │ ← question
+        │ Classify        │ ← question + classification
         │ Question        │
         └─────────────────┘
               ↓
         ┌─────────────────┐
-        │ Retrieve        │ ← classification
-        │ Data            │
+        │ Conditional     │ ← routing based on classification
+        │ Routing         │
         └─────────────────┘
               ↓
         ┌─────────────────┐
-        │ Generate        │ ← relevant_data
+        │ Retriever       │ ← intelligent tool selection
+        │ Agent           │
+        └─────────────────┘
+              ↓
+        ┌─────────────────┐
+        │ Tool Execution  │ ← agent-based or direct execution
+        │ & Data Retrieval│
+        └─────────────────┘
+              ↓
+        ┌─────────────────┐
+        │ Generate        │ ← comprehensive analysis
         │ Answer          │
         └─────────────────┘
               ↓
@@ -402,7 +554,20 @@ Always be thorough and provide actionable insights from the data."""),
             """
             
             print(workflow_structure)
-            print("="*60)
+            
+            print("\n🔄 CONDITIONAL ROUTING PATHS:")
+            print("  • aws_costs → retrieve_aws_data → AWS Data Retrieval Tool")
+            print("  • budget → retrieve_budget_data → Budget Data Retrieval Tool")
+            print("  • vendor_spend → retrieve_vendor_data → Vendor Data Retrieval Tool")
+            
+            print("\n🤖 RETRIEVER AGENT FEATURES:")
+            print("  • Intelligent tool routing based on classification")
+            print("  • Context-aware tool selection")
+            print("  • Automatic fallback to direct tool execution")
+            print("  • Tool usage tracking and analytics")
+            print("  • Performance monitoring and optimization")
+            
+            print("="*80)
     
     def display_latency_metrics(self, state: WorkflowState = None):
         """Display latency metrics for workflow performance analysis"""
@@ -433,13 +598,15 @@ Always be thorough and provide actionable insights from the data."""),
             dr_metrics = latency_metrics["data_retrieval"]
             print(f"\n🔍 DATA RETRIEVAL:")
             print(f"   • Total Duration: {dr_metrics.get('total_duration_seconds', 0)}s")
-            print(f"   • Agent Duration: {dr_metrics.get('agent_duration_seconds', 0)}s")
+            print(f"   • Tool Duration: {dr_metrics.get('tool_duration_seconds', 0)}s")
             print(f"   • Overhead: {dr_metrics.get('overhead_duration_seconds', 0)}s")
             print(f"   • Status: {dr_metrics.get('status', 'unknown')}")
             if "retrieval_metadata" in state.get("relevant_data", {}):
                 metadata = state["relevant_data"]["retrieval_metadata"]
                 print(f"   • Response Length: {metadata.get('response_length', 0)} characters")
                 print(f"   • Tools Executed: {metadata.get('tools_executed', 0)}")
+                print(f"   • Tool Used: {metadata.get('tool_used', 'unknown')}")
+                print(f"   • Data Source: {metadata.get('data_source', 'unknown')}")
         
         # Response Generation Metrics
         if "response_generation" in latency_metrics:
@@ -453,6 +620,87 @@ Always be thorough and provide actionable insights from the data."""),
             print(f"   • Output Tokens: {rg_metrics.get('output_tokens', 0)}")
             print(f"   • Total Tokens: {rg_metrics.get('total_tokens', 0)}")
             print(f"   • Status: {rg_metrics.get('status', 'unknown')}")
+        
+        # Tool Usage and Message State
+        if "tools_used" in state:
+            print(f"\n🔧 TOOL USAGE:")
+            tools_used = state["tools_used"]
+            print(f"   • Tools Executed: {', '.join(tools_used) if tools_used else 'None'}")
+            print(f"   • Total Tools Used: {len(tools_used)}")
+            
+            # Tool-specific performance metrics
+            if tools_used and "data_retrieval" in latency_metrics:
+                dr_metrics = latency_metrics["data_retrieval"]
+                
+                # Check if retriever agent was used
+                relevant_data = state.get("relevant_data", {})
+                if "retrieval_method" in relevant_data and "retriever_agent" in relevant_data["retrieval_method"]:
+                    print(f"   • Retrieval Method: {relevant_data['data_retrieval_method']}")
+                    print(f"   • Agent Execution Time: {dr_metrics.get('agent_duration_seconds', 0):.3f}s")
+                    print(f"   • Agent Overhead: {dr_metrics.get('overhead_duration_seconds', 0):.3f}s")
+                    
+                    # Show tool usage summary if available
+                    if "tool_usage_summary" in relevant_data:
+                        tool_summary = relevant_data["tool_usage_summary"]
+                        print(f"   • Agent Tool Executions: {len(tool_summary)}")
+                        for tool_name, tool_info in tool_summary.items():
+                            executions = tool_info.get("executions", 0)
+                            print(f"     - {tool_name}: {executions} execution(s)")
+                    
+                else:
+                    # Fallback method was used
+                    print(f"   • Retrieval Method: {relevant_data.get('data_retrieval_method', 'Unknown')}")
+                    print(f"   • Tool Execution Time: {dr_metrics.get('tool_duration_seconds', 0):.3f}s")
+                    print(f"   • Tool Overhead: {dr_metrics.get('overhead_duration_seconds', 0):.3f}s")
+                
+                # Show which specific tool was used
+                if "tool_used" in relevant_data:
+                    print(f"   • Primary Tool: {relevant_data['tool_used']}")
+                    print(f"   • Tool Description: {relevant_data.get('tool_description', 'N/A')}")
+                
+                # Performance efficiency
+                total_time = dr_metrics.get('total_duration_seconds', 0)
+                if total_time > 0:
+                    if "agent_duration_seconds" in dr_metrics:
+                        efficiency = (dr_metrics.get('agent_duration_seconds', 0) / total_time) * 100
+                        print(f"   • Agent Efficiency: {efficiency:.1f}% (agent time vs total time)")
+                    elif "tool_duration_seconds" in dr_metrics:
+                        efficiency = (dr_metrics.get('tool_duration_seconds', 0) / total_time) * 100
+                        print(f"   • Tool Efficiency: {efficiency:.1f}% (tool time vs total time)")
+        
+        if "messages" in state:
+            print(f"\n💬 MESSAGE STATE:")
+            messages = state["messages"]
+            print(f"   • Total Messages: {len(messages)}")
+            print(f"   • Message Types: {', '.join(set([msg.__class__.__name__ for msg in messages]))}")
+            print(f"   • Workflow Progress: {len([m for m in messages if 'initiated' in m.content.lower()])} steps initiated")
+            
+            # Message performance analysis
+            if messages:
+                # Count messages by type
+                message_counts = {}
+                for msg in messages:
+                    msg_type = msg.__class__.__name__
+                    message_counts[msg_type] = message_counts.get(msg_type, 0) + 1
+                
+                print(f"   • Message Distribution:")
+                for msg_type, count in message_counts.items():
+                    percentage = (count / len(messages)) * 100
+                    print(f"     - {msg_type}: {count} ({percentage:.1f}%)")
+                
+                # Workflow step analysis
+                workflow_steps = [msg.content for msg in messages if 'initiated' in msg.content.lower()]
+                if workflow_steps:
+                    print(f"   • Workflow Steps: {len(workflow_steps)}")
+                    for i, step in enumerate(workflow_steps, 1):
+                        print(f"     {i}. {step}")
+                
+                # Show retriever agent messages
+                agent_messages = [msg.content for msg in messages if 'retriever agent' in msg.content.lower()]
+                if agent_messages:
+                    print(f"   • Retriever Agent Messages: {len(agent_messages)}")
+                    for msg in agent_messages:
+                        print(f"     - {msg}")
         
         # Performance Summary
         total_duration = sum([
@@ -471,9 +719,16 @@ Always be thorough and provide actionable insights from the data."""),
         ])
         print(f"   • LLM Operations: {llm_ops_time:.3f}s")
         
-        # Calculate agent operations time
-        agent_ops_time = latency_metrics.get('data_retrieval', {}).get('agent_duration_seconds', 0)
-        print(f"   • Agent Operations: {agent_ops_time:.3f}s")
+        # Calculate agent/tool operations time
+        dr_metrics = latency_metrics.get('data_retrieval', {})
+        if "agent_duration_seconds" in dr_metrics:
+            agent_ops_time = dr_metrics.get('agent_duration_seconds', 0)
+            print(f"   • Retriever Agent Operations: {agent_ops_time:.3f}s")
+        elif "tool_duration_seconds" in dr_metrics:
+            tool_ops_time = dr_metrics.get('tool_duration_seconds', 0)
+            print(f"   • Tool Operations: {tool_ops_time:.3f}s")
+        else:
+            print(f"   • Data Retrieval Operations: {dr_metrics.get('total_duration_seconds', 0):.3f}s")
         
         # Calculate system overhead time
         system_overhead = sum([
@@ -483,7 +738,41 @@ Always be thorough and provide actionable insights from the data."""),
         ])
         print(f"   • System Overhead: {system_overhead:.3f}s")
         
-        # Calculate total token usage
+        # Tool performance analysis
+        if tools_used:
+            print(f"\n🔧 TOOL PERFORMANCE ANALYSIS:")
+            print(f"   • Tools Executed: {len(tools_used)}")
+            
+            # Determine operation time based on retrieval method
+            relevant_data = state.get("relevant_data", {})
+            if "retrieval_method" in relevant_data and "retriever_agent" in relevant_data["retrieval_method"]:
+                agent_time = dr_metrics.get('agent_duration_seconds', 0)
+                print(f"   • Retriever Agent Time: {agent_time:.3f}s")
+                print(f"   • Agent Efficiency: {(agent_time/total_duration*100):.1f}% of total workflow time")
+                
+                # Show agent tool execution details
+                if "tool_usage_summary" in relevant_data:
+                    tool_summary = relevant_data["tool_usage_summary"]
+                    print(f"   • Agent Tool Executions: {sum([info.get('executions', 0) for info in tool_summary.values()])}")
+            else:
+                tool_time = dr_metrics.get('tool_duration_seconds', 0)
+                print(f"   • Tool Execution Time: {tool_time:.3f}s")
+                print(f"   • Tool Efficiency: {(tool_time/total_duration*100):.1f}% of total workflow time")
+            
+            # Tool-specific breakdown if available
+            if "retrieval_metadata" in relevant_data:
+                metadata = relevant_data["retrieval_metadata"]
+                print(f"   • Response Length: {metadata.get('response_length', 0)} characters")
+                
+                # Calculate processing rate
+                if "agent_duration_seconds" in metadata and metadata["agent_duration_seconds"] > 0:
+                    rate = metadata.get('response_length', 0) / metadata["agent_duration_seconds"]
+                    print(f"   • Agent Processing Rate: {rate:.0f} chars/sec")
+                elif "tool_duration_seconds" in metadata and metadata["tool_duration_seconds"] > 0:
+                    rate = metadata.get('response_length', 0) / metadata["tool_duration_seconds"]
+                    print(f"   • Tool Processing Rate: {rate:.0f} chars/sec")
+        
+        # Cost analysis with tool usage
         total_input_tokens = sum([
             latency_metrics.get("question_classification", {}).get("input_tokens", 0),
             latency_metrics.get("response_generation", {}).get("input_tokens", 0)
@@ -494,11 +783,39 @@ Always be thorough and provide actionable insights from the data."""),
         ])
         total_tokens = total_input_tokens + total_output_tokens
         
-        print(f"\n🔤 TOKEN USAGE SUMMARY:")
+        print(f"\n🔤 TOKEN USAGE & COST ANALYSIS:")
         print(f"   • Total Input Tokens: {total_input_tokens}")
         print(f"   • Total Output Tokens: {total_output_tokens}")
         print(f"   • Total Tokens: {total_tokens}")
-        print(f"   • Estimated Cost (GPT-3.5-turbo): ${(total_tokens * 0.000002):.4f}")
+        print(f"   • Estimated Cost (GPT-4o-mini): ${(total_tokens * 0.00001):.4f}")
+        
+        # Cost per tool operation
+        if tools_used:
+            cost_per_tool = (total_tokens * 0.00001) / len(tools_used) if tools_used else 0
+            print(f"   • Cost per Tool Operation: ${cost_per_tool:.4f}")
+        
+        # Performance efficiency metrics
+        if total_duration > 0:
+            print(f"\n⚡ EFFICIENCY METRICS:")
+            llm_efficiency = (llm_ops_time / total_duration) * 100
+            tool_efficiency = (tool_ops_time / total_duration) * 100
+            overhead_efficiency = (system_overhead / total_duration) * 100
+            
+            print(f"   • LLM Efficiency: {llm_efficiency:.1f}%")
+            print(f"   • Tool Efficiency: {tool_efficiency:.1f}%")
+            print(f"   • System Overhead: {overhead_efficiency:.1f}%")
+            
+            # Performance rating
+            if overhead_efficiency < 20:
+                performance_rating = "Excellent"
+            elif overhead_efficiency < 40:
+                performance_rating = "Good"
+            elif overhead_efficiency < 60:
+                performance_rating = "Fair"
+            else:
+                performance_rating = "Needs Improvement"
+            
+            print(f"   • Overall Performance Rating: {performance_rating}")
         
         print("="*60)
     
@@ -515,22 +832,36 @@ Always be thorough and provide actionable insights from the data."""),
             return len(text) // 4
     
     def _create_workflow(self) -> StateGraph:
-        """Create the LangGraph workflow"""
+        """Create the LangGraph workflow with conditional routing based on classification"""
         
         # Create the graph
         workflow = StateGraph(WorkflowState)
         
         # Add nodes
         workflow.add_node("classify_question", self._classify_question)
-        workflow.add_node("retrieve_data", self._retrieve_data)
+        workflow.add_node("retrieve_aws_data", self._retrieve_aws_data_direct)
+        workflow.add_node("retrieve_budget_data", self._retrieve_budget_data_direct)
+        workflow.add_node("retrieve_vendor_data", self._retrieve_vendor_data_direct)
         workflow.add_node("generate_answer", self._generate_answer)
         
         # Set entry point
         workflow.set_entry_point("classify_question")
         
-        # Add edges
-        workflow.add_edge("classify_question", "retrieve_data")
-        workflow.add_edge("retrieve_data", "generate_answer")
+        # Add conditional edges based on classification
+        workflow.add_conditional_edges(
+            "classify_question",
+            self._route_based_on_classification,
+            {
+                "aws_costs": "retrieve_aws_data",
+                "budget": "retrieve_budget_data", 
+                "vendor_spend": "retrieve_vendor_data"
+            }
+        )
+        
+        # Add edges to generate answer
+        workflow.add_edge("retrieve_aws_data", "generate_answer")
+        workflow.add_edge("retrieve_budget_data", "generate_answer")
+        workflow.add_edge("retrieve_vendor_data", "generate_answer")
         workflow.add_edge("generate_answer", END)
         
         # Compile the workflow
@@ -609,10 +940,19 @@ Always be thorough and provide actionable insights from the data."""),
                 }
             }
             
+            # Add messages to state for tracking
+            messages = state.get("messages", [])
+            messages.extend([
+                SystemMessage(content="Question classification initiated"),
+                HumanMessage(content=classification_prompt),
+                response
+            ])
+            
             return {
                 **state,
                 "classification": classification,
-                "latency_metrics": latency_metrics
+                "latency_metrics": latency_metrics,
+                "messages": messages
             }
             
         except Exception as e:
@@ -632,15 +972,25 @@ Always be thorough and provide actionable insights from the data."""),
                 }
             }
             
+            # Add error message to state
+            messages = state.get("messages", [])
+            messages.append(SystemMessage(content=f"Classification error: {str(e)}"))
+            
             return {
                 **state,
                 "classification": "budget",  # Default fallback
                 "error": f"Classification error: {str(e)}",
-                "latency_metrics": latency_metrics
+                "latency_metrics": latency_metrics,
+                "messages": messages
             }
     
-    def _retrieve_data(self, state: WorkflowState) -> WorkflowState:
-        """Retrieve relevant data using the intelligent agent with latency tracking"""
+    def _route_based_on_classification(self, state: WorkflowState) -> str:
+        """Route the workflow based on the classification of the question"""
+        classification = state.get("classification", "budget") # Default to budget if classification is missing
+        return classification
+    
+    def _retrieve_aws_data_direct(self, state: WorkflowState) -> WorkflowState:
+        """Retrieve AWS cost data using the retriever agent with intelligent tool routing"""
         start_time = time.time()
         retrieval_start = datetime.now()
         
@@ -648,53 +998,61 @@ Always be thorough and provide actionable insights from the data."""),
             question = state["question"]
             classification = state["classification"]
             
-            # Create a context-aware query for the agent
-            agent_query = f"""
-Based on the classification '{classification}', please analyze the following question and retrieve relevant data:
-
-Question: {question}
-
-Please provide a comprehensive analysis including:
-1. Key metrics and statistics
-2. Anomaly detection
-3. Trends and patterns
-4. Business insights
-5. Recommendations
-
-Use the most appropriate data retrieval tools to gather comprehensive information.
-            """
-            
-            # Track agent invocation time
+            # Use the retriever agent for intelligent data retrieval
             agent_start = time.time()
-            agent_response = self.data_retrieval_agent.invoke({
-                "input": agent_query
-            })
+            retrieval_result = self.retriever_agent.retrieve_data(question, classification)
             agent_duration = time.time() - agent_start
             
-            # Extract the agent's response
-            if "output" in agent_response:
+            if retrieval_result["success"]:
+                # Extract data from successful retrieval
                 relevant_data = {
-                    "agent_analysis": agent_response["output"],
+                    "data_source": "retriever_agent_aws",
                     "classification": classification,
                     "query": question,
-                    "data_retrieval_method": "intelligent_agent",
-                    "tools_used": [tool.name for tool in [self.aws_tool, self.budget_tool, self.vendor_tool]],
+                    "data_retrieval_method": "intelligent_agent_routing",
+                    "agent_data": retrieval_result["data"],
+                    "tool_execution": retrieval_result.get("tool_execution", []),
                     "retrieval_metadata": {
                         "agent_duration_seconds": round(agent_duration, 3),
-                        "response_length": len(agent_response["output"]),
-                        "tools_executed": len([tool.name for tool in [self.aws_tool, self.budget_tool, self.vendor_tool]])
+                        "response_length": len(retrieval_result["data"]),
+                        "tools_executed": len(retrieval_result.get("tool_execution", [])),
+                        "retrieval_method": "retriever_agent"
                     }
                 }
+                
+                # Get tool usage summary
+                tool_summary = self.retriever_agent.get_tool_usage_summary(
+                    retrieval_result.get("tool_execution", [])
+                )
+                relevant_data["tool_usage_summary"] = tool_summary
+                
+                # Extract tools used from agent execution
+                tools_used = list(tool_summary.keys()) if tool_summary else []
+                
             else:
+                # Fallback to direct tool execution if agent fails
+                print(f"Retriever agent failed, falling back to direct tool execution: {retrieval_result.get('error', 'Unknown error')}")
+                
+                tool_start = time.time()
+                aws_data = self.aws_tool._run(question)
+                tool_duration = time.time() - tool_start
+                
                 relevant_data = {
-                    "error": "Agent response format unexpected",
-                    "raw_response": agent_response,
+                    "data_source": "aws_data_retrieval_fallback",
+                    "classification": classification,
+                    "query": question,
+                    "data_retrieval_method": "direct_tool_execution_fallback",
+                    "raw_data": aws_data,
                     "retrieval_metadata": {
                         "agent_duration_seconds": round(agent_duration, 3),
-                        "response_length": 0,
-                        "tools_executed": 0
+                        "tool_duration_seconds": round(tool_duration, 3),
+                        "response_length": len(aws_data),
+                        "tools_executed": 1,
+                        "retrieval_method": "fallback_direct"
                     }
                 }
+                
+                tools_used = [self.aws_tool.name]
             
             total_duration = time.time() - start_time
             retrieval_end = datetime.now()
@@ -712,10 +1070,23 @@ Use the most appropriate data retrieval tools to gather comprehensive informatio
                 }
             })
             
+            # Update tools used and messages
+            current_tools_used = state.get("tools_used", [])
+            current_tools_used.extend(tools_used)
+            
+            messages = state.get("messages", [])
+            messages.extend([
+                SystemMessage(content=f"Retrieved AWS data using retriever agent with tools: {', '.join(tools_used)}"),
+                SystemMessage(content=f"Agent execution time: {agent_duration:.3f}s"),
+                SystemMessage(content=f"Retrieval method: {relevant_data['data_retrieval_method']}")
+            ])
+            
             return {
                 **state,
                 "relevant_data": relevant_data,
-                "latency_metrics": latency_metrics
+                "latency_metrics": latency_metrics,
+                "tools_used": current_tools_used,
+                "messages": messages
             }
             
         except Exception as e:
@@ -736,11 +1107,276 @@ Use the most appropriate data retrieval tools to gather comprehensive informatio
                 }
             })
             
+            # Add error message to state
+            messages = state.get("messages", [])
+            messages.append(SystemMessage(content=f"AWS data retrieval error: {str(e)}"))
+            
             return {
                 **state,
-                "relevant_data": {"error": f"Error in agent-based data retrieval: {str(e)}"},
+                "relevant_data": {"error": f"Error in AWS data retrieval: {str(e)}"},
                 "error": str(e),
-                "latency_metrics": latency_metrics
+                "latency_metrics": latency_metrics,
+                "messages": messages
+            }
+    
+    def _retrieve_budget_data_direct(self, state: WorkflowState) -> WorkflowState:
+        """Retrieve budget tracking data using the retriever agent with intelligent tool routing"""
+        start_time = time.time()
+        retrieval_start = datetime.now()
+        
+        try:
+            question = state["question"]
+            classification = state["classification"]
+            
+            # Use the retriever agent for intelligent data retrieval
+            agent_start = time.time()
+            retrieval_result = self.retriever_agent.retrieve_data(question, classification)
+            agent_duration = time.time() - agent_start
+            
+            if retrieval_result["success"]:
+                # Extract data from successful retrieval
+                relevant_data = {
+                    "data_source": "retriever_agent_budget",
+                    "classification": classification,
+                    "query": question,
+                    "data_retrieval_method": "intelligent_agent_routing",
+                    "agent_data": retrieval_result["data"],
+                    "tool_execution": retrieval_result.get("tool_execution", []),
+                    "retrieval_metadata": {
+                        "agent_duration_seconds": round(agent_duration, 3),
+                        "response_length": len(retrieval_result["data"]),
+                        "tools_executed": len(retrieval_result.get("tool_execution", [])),
+                        "retrieval_method": "retriever_agent"
+                    }
+                }
+                
+                # Get tool usage summary
+                tool_summary = self.retriever_agent.get_tool_usage_summary(
+                    retrieval_result.get("tool_execution", [])
+                )
+                relevant_data["tool_usage_summary"] = tool_summary
+                
+                # Extract tools used from agent execution
+                tools_used = list(tool_summary.keys()) if tool_summary else []
+                
+            else:
+                # Fallback to direct tool execution if agent fails
+                print(f"Retriever agent failed, falling back to direct tool execution: {retrieval_result.get('error', 'Unknown error')}")
+                
+                tool_start = time.time()
+                budget_data = self.budget_tool._run(question)
+                tool_duration = time.time() - tool_start
+                
+                relevant_data = {
+                    "data_source": "budget_data_retrieval_fallback",
+                    "classification": classification,
+                    "query": question,
+                    "data_retrieval_method": "direct_tool_execution_fallback",
+                    "raw_data": budget_data,
+                    "retrieval_metadata": {
+                        "agent_duration_seconds": round(agent_duration, 3),
+                        "tool_duration_seconds": round(tool_duration, 3),
+                        "response_length": len(budget_data),
+                        "tools_executed": 1,
+                        "retrieval_method": "fallback_direct"
+                    }
+                }
+                
+                tools_used = [self.budget_tool.name]
+            
+            total_duration = time.time() - start_time
+            retrieval_end = datetime.now()
+            
+            # Update latency metrics
+            latency_metrics = state.get("latency_metrics", {})
+            latency_metrics.update({
+                "data_retrieval": {
+                    "start_time": retrieval_start.isoformat(),
+                    "end_time": retrieval_end.isoformat(),
+                    "total_duration_seconds": round(total_duration, 3),
+                    "agent_duration_seconds": round(agent_duration, 3),
+                    "overhead_duration_seconds": round(total_duration - agent_duration, 3),
+                    "status": "success"
+                }
+            })
+            
+            # Update tools used and messages
+            current_tools_used = state.get("tools_used", [])
+            current_tools_used.extend(tools_used)
+            
+            messages = state.get("messages", [])
+            messages.extend([
+                SystemMessage(content=f"Retrieved budget data using retriever agent with tools: {', '.join(tools_used)}"),
+                SystemMessage(content=f"Agent execution time: {agent_duration:.3f}s"),
+                SystemMessage(content=f"Retrieval method: {relevant_data['data_retrieval_method']}")
+            ])
+            
+            return {
+                **state,
+                "relevant_data": relevant_data,
+                "latency_metrics": latency_metrics,
+                "tools_used": current_tools_used,
+                "messages": messages
+            }
+            
+        except Exception as e:
+            total_duration = time.time() - start_time
+            retrieval_end = datetime.now()
+            
+            # Update latency metrics with error
+            latency_metrics = state.get("latency_metrics", {})
+            latency_metrics.update({
+                "data_retrieval": {
+                    "start_time": retrieval_start.isoformat(),
+                    "end_time": retrieval_end.isoformat(),
+                    "total_duration_seconds": round(total_duration, 3),
+                    "agent_duration_seconds": 0,
+                    "overhead_duration_seconds": round(total_duration, 3),
+                    "status": "error",
+                    "error_message": str(e)
+                }
+            })
+            
+            # Add error message to state
+            messages = state.get("messages", [])
+            messages.append(SystemMessage(content=f"Budget data retrieval error: {str(e)}"))
+            
+            return {
+                **state,
+                "relevant_data": {"error": f"Error in budget data retrieval: {str(e)}"},
+                "error": str(e),
+                "latency_metrics": latency_metrics,
+                "messages": messages
+            }
+    
+    def _retrieve_vendor_data_direct(self, state: WorkflowState) -> WorkflowState:
+        """Retrieve vendor spending data using the retriever agent with intelligent tool routing"""
+        start_time = time.time()
+        retrieval_start = datetime.now()
+        
+        try:
+            question = state["question"]
+            classification = state["classification"]
+            
+            # Use the retriever agent for intelligent data retrieval
+            agent_start = time.time()
+            retrieval_result = self.retriever_agent.retrieve_data(question, classification)
+            agent_duration = time.time() - agent_start
+            
+            if retrieval_result["success"]:
+                # Extract data from successful retrieval
+                relevant_data = {
+                    "data_source": "retriever_agent_vendor",
+                    "classification": classification,
+                    "query": question,
+                    "data_retrieval_method": "intelligent_agent_routing",
+                    "agent_data": retrieval_result["data"],
+                    "tool_execution": retrieval_result.get("tool_execution", []),
+                    "retrieval_metadata": {
+                        "agent_duration_seconds": round(agent_duration, 3),
+                        "response_length": len(retrieval_result["data"]),
+                        "tools_executed": len(retrieval_result.get("tool_execution", [])),
+                        "retrieval_method": "retriever_agent"
+                    }
+                }
+                
+                # Get tool usage summary
+                tool_summary = self.retriever_agent.get_tool_usage_summary(
+                    retrieval_result.get("tool_execution", [])
+                )
+                relevant_data["tool_usage_summary"] = tool_summary
+                
+                # Extract tools used from agent execution
+                tools_used = list(tool_summary.keys()) if tool_summary else []
+                
+            else:
+                # Fallback to direct tool execution if agent fails
+                print(f"Retriever agent failed, falling back to direct tool execution: {retrieval_result.get('error', 'Unknown error')}")
+                
+                tool_start = time.time()
+                vendor_data = self.vendor_tool._run(question)
+                tool_duration = time.time() - tool_start
+                
+                relevant_data = {
+                    "data_source": "vendor_data_retrieval_fallback",
+                    "classification": classification,
+                    "query": question,
+                    "data_retrieval_method": "direct_tool_execution_fallback",
+                    "raw_data": vendor_data,
+                    "retrieval_metadata": {
+                        "agent_duration_seconds": round(agent_duration, 3),
+                        "tool_duration_seconds": round(tool_duration, 3),
+                        "response_length": len(vendor_data),
+                        "tools_executed": 1,
+                        "retrieval_method": "fallback_direct"
+                    }
+                }
+                
+                tools_used = [self.vendor_tool.name]
+            
+            total_duration = time.time() - start_time
+            retrieval_end = datetime.now()
+            
+            # Update latency metrics
+            latency_metrics = state.get("latency_metrics", {})
+            latency_metrics.update({
+                "data_retrieval": {
+                    "start_time": retrieval_start.isoformat(),
+                    "end_time": retrieval_end.isoformat(),
+                    "total_duration_seconds": round(total_duration, 3),
+                    "agent_duration_seconds": round(agent_duration, 3),
+                    "overhead_duration_seconds": round(total_duration - agent_duration, 3),
+                    "status": "success"
+                }
+            })
+            
+            # Update tools used and messages
+            current_tools_used = state.get("tools_used", [])
+            current_tools_used.extend(tools_used)
+            
+            messages = state.get("messages", [])
+            messages.extend([
+                SystemMessage(content=f"Retrieved vendor data using retriever agent with tools: {', '.join(tools_used)}"),
+                SystemMessage(content=f"Agent execution time: {agent_duration:.3f}s"),
+                SystemMessage(content=f"Retrieval method: {relevant_data['data_retrieval_method']}")
+            ])
+            
+            return {
+                **state,
+                "relevant_data": relevant_data,
+                "latency_metrics": latency_metrics,
+                "tools_used": current_tools_used,
+                "messages": messages
+            }
+            
+        except Exception as e:
+            total_duration = time.time() - start_time
+            retrieval_end = datetime.now()
+            
+            # Update latency metrics with error
+            latency_metrics = state.get("latency_metrics", {})
+            latency_metrics.update({
+                "data_retrieval": {
+                    "start_time": retrieval_start.isoformat(),
+                    "end_time": retrieval_end.isoformat(),
+                    "total_duration_seconds": round(total_duration, 3),
+                    "agent_duration_seconds": 0,
+                    "overhead_duration_seconds": round(total_duration, 3),
+                    "status": "error",
+                    "error_message": str(e)
+                }
+            })
+            
+            # Add error message to state
+            messages = state.get("messages", [])
+            messages.append(SystemMessage(content=f"Vendor data retrieval error: {str(e)}"))
+            
+            return {
+                **state,
+                "relevant_data": {"error": f"Error in vendor data retrieval: {str(e)}"},
+                "error": str(e),
+                "latency_metrics": latency_metrics,
+                "messages": messages
             }
     
     def _retrieve_aws_data(self, question: str) -> Dict[str, Any]:
@@ -933,6 +1569,7 @@ Use the most appropriate data retrieval tools to gather comprehensive informatio
             question = state['question']
             classification = state['classification']
             relevant_data = state['relevant_data']
+            tools_used = state.get('tools_used', [])
             
             if 'error' in relevant_data:
                 answer = f"Error retrieving data: {relevant_data['error']}"
@@ -953,10 +1590,15 @@ Use the most appropriate data retrieval tools to gather comprehensive informatio
                     }
                 })
                 
+                # Add error message to state
+                messages = state.get("messages", [])
+                messages.append(SystemMessage(content=f"Generated error answer: {answer}"))
+                
                 return {
                     **state,
                     "final_answer": answer,
-                    "latency_metrics": latency_metrics
+                    "latency_metrics": latency_metrics,
+                    "messages": messages
                 }
             else:
                 # Create a detailed prompt for answer generation with full data access
@@ -966,6 +1608,7 @@ Use the most appropriate data retrieval tools to gather comprehensive informatio
 
                 Question: {question}
                 Classification: {classification}
+                Tools Used: {', '.join(tools_used)}
 
                 **COMPLETE DATA ACCESS FOR ANALYSIS:**
                 {self._format_complete_data_for_analysis(relevant_data)}
@@ -1088,10 +1731,19 @@ Use the most appropriate data retrieval tools to gather comprehensive informatio
                     }
                 })
                 
+                # Add final answer message to state
+                messages = state.get("messages", [])
+                messages.extend([
+                    SystemMessage(content="Generated final answer using LLM"),
+                    SystemMessage(content=f"Answer length: {len(answer)} characters"),
+                    SystemMessage(content=f"Tools used in workflow: {', '.join(tools_used)}")
+                ])
+                
                 return {
                     **state,
                     "final_answer": answer,
-                    "latency_metrics": latency_metrics
+                    "latency_metrics": latency_metrics,
+                    "messages": messages
                 }
             
         except Exception as e:
@@ -1113,11 +1765,16 @@ Use the most appropriate data retrieval tools to gather comprehensive informatio
                 }
             })
             
+            # Add error message to state
+            messages = state.get("messages", [])
+            messages.append(SystemMessage(content=f"Answer generation error: {str(e)}"))
+            
             return {
                 **state,
                 "final_answer": f"Error generating answer: {str(e)}",
                 "error": str(e),
-                "latency_metrics": latency_metrics
+                "latency_metrics": latency_metrics,
+                "messages": messages
             }
     
     def _format_data_for_prompt(self, data: Dict[str, Any]) -> str:
@@ -1245,7 +1902,9 @@ Use the most appropriate data retrieval tools to gather comprehensive informatio
             "classification": "",
             "relevant_data": {},
             "final_answer": "",
-            "error": ""
+            "error": "",
+            "messages": [], # Initialize messages
+            "tools_used": [] # Initialize tools_used
         }
         
         try:
@@ -1256,3 +1915,195 @@ Use the most appropriate data retrieval tools to gather comprehensive informatio
                 **initial_state,
                 "error": f"Workflow execution error: {str(e)}"
             }
+
+    def display_workflow(self):
+        """Display the enhanced workflow structure with retriever agent and tool routing"""
+        print("\n" + "="*100)
+        print("🚀 ENHANCED AUTO-SPEND WORKFLOW WITH RETRIEVER AGENT")
+        print("="*100)
+        
+        # Workflow Overview
+        print("\n📋 WORKFLOW OVERVIEW")
+        print("   This is an intelligent financial analysis workflow that uses:")
+        print("   • Advanced question classification")
+        print("   • Conditional routing based on classification")
+        print("   • Retriever agent for intelligent tool selection")
+        print("   • Specialized data retrieval tools")
+        print("   • Comprehensive performance monitoring")
+        
+        # Workflow Structure
+        print("\n🔄 WORKFLOW STRUCTURE")
+        print("   START")
+        print("     ↓")
+        print("   📝 classify_question")
+        print("     ↓")
+        print("   🔄 conditional_routing")
+        print("     ↓")
+        print("   🤖 retriever_agent_execution")
+        print("     ↓")
+        print("   🔧 tool_execution")
+        print("     ↓")
+        print("   💡 generate_answer")
+        print("     ↓")
+        print("   END")
+        
+        # Conditional Routing Details
+        print("\n🔄 CONDITIONAL ROUTING PATHS")
+        print("   Based on question classification, the workflow routes to specific data retrieval nodes:")
+        print("   ")
+        print("   🔴 aws_costs → retrieve_aws_data")
+        print("      ├─ Tool: AWS Data Retrieval")
+        print("      ├─ Data: Cloud infrastructure costs, service breakdowns, trends")
+        print("      └─ Features: Anomaly detection, cost optimization insights")
+        print("   ")
+        print("   🟡 budget → retrieve_budget_data")
+        print("      ├─ Tool: Budget Data Retrieval")
+        print("      ├─ Data: Project budgets, team spending, variance analysis")
+        print("      └─ Features: Budget tracking, variance reporting, project monitoring")
+        print("   ")
+        print("   🟢 vendor_spend → retrieve_vendor_data")
+        print("      ├─ Tool: Vendor Data Retrieval")
+        print("      ├─ Data: Contract details, risk assessment, spending patterns")
+        print("      └─ Features: Risk analysis, contract monitoring, vendor optimization")
+        
+        # Retriever Agent Details
+        print("\n🤖 RETRIEVER AGENT ARCHITECTURE")
+        print("   The retriever agent intelligently routes classification responses to specific tools:")
+        print("   ")
+        print("   🧠 Intelligent Routing:")
+        print("      • Analyzes question context and classification")
+        print("      • Determines optimal tool selection")
+        print("      • Can use multiple tools for complex questions")
+        print("   ")
+        print("   🔄 Fallback Strategy:")
+        print("      • Automatically falls back to direct tool execution if agent fails")
+        print("      • Ensures workflow reliability and continuity")
+        print("      • Maintains performance even during agent issues")
+        print("   ")
+        print("   📊 Tool Usage Tracking:")
+        print("      • Records which tools were executed")
+        print("      • Tracks execution counts and performance")
+        print("      • Provides analytics for optimization")
+        
+        # Data Retrieval Tools
+        print("\n🔧 DATA RETRIEVAL TOOLS")
+        print("   Each tool is specialized for specific financial data analysis:")
+        print("   ")
+        print("   ☁️  AWS Data Retrieval Tool:")
+        print("      • Name: aws_data_retrieval")
+        print("      • Purpose: Cloud infrastructure cost analysis")
+        print("      • Capabilities: Daily costs, service breakdowns, trend analysis")
+        print("      • Output: Comprehensive AWS cost insights with anomaly detection")
+        print("   ")
+        print("   💰 Budget Data Retrieval Tool:")
+        print("      • Name: budget_data_retrieval")
+        print("      • Purpose: Project budget tracking and variance analysis")
+        print("      • Capabilities: Budget monitoring, team spending, status tracking")
+        print("      • Output: Budget performance insights with variance reporting")
+        print("   ")
+        print("   🏢 Vendor Data Retrieval Tool:")
+        print("      • Name: vendor_data_retrieval")
+        print("      • Purpose: Vendor spending and contract analysis")
+        print("      • Capabilities: Contract monitoring, risk assessment, spending patterns")
+        print("      • Output: Vendor performance insights with risk analysis")
+        
+        # State Management
+        print("\n💬 STATE MANAGEMENT & TRACKING")
+        print("   The workflow maintains comprehensive state throughout execution:")
+        print("   ")
+        print("   📝 Message State:")
+        print("      • Tracks all workflow progression messages")
+        print("      • Records classification, tool execution, and answer generation")
+        print("      • Provides complete audit trail for debugging")
+        print("   ")
+        print("   🔧 Tool Usage Tracking:")
+        print("      • Records which tools were executed")
+        print("      • Tracks execution counts and performance metrics")
+        print("      • Enables optimization and cost analysis")
+        print("   ")
+        print("   ⚡ Latency Metrics:")
+        print("      • Comprehensive performance monitoring")
+        print("      • Step-by-step timing analysis")
+        print("      • Efficiency calculations and ratings")
+        
+        # Performance Monitoring
+        print("\n⚡ ENHANCED PERFORMANCE MONITORING")
+        print("   The workflow provides detailed performance analytics:")
+        print("   ")
+        print("   📊 Classification Metrics:")
+        print("      • Question analysis time and token usage")
+        print("      • Classification accuracy and confidence")
+        print("      • LLM performance and cost tracking")
+        print("   ")
+        print("   🤖 Retriever Agent Metrics:")
+        print("      • Agent execution time and efficiency")
+        print("      • Tool routing decisions and success rates")
+        print("      • Fallback frequency and performance")
+        print("   ")
+        print("   🔧 Tool Execution Metrics:")
+        print("      • Individual tool performance times")
+        print("      • Data retrieval efficiency and rates")
+        print("      • Tool usage analytics and optimization")
+        print("   ")
+        print("   💡 Answer Generation Metrics:")
+        print("      • LLM processing time and quality")
+        print("      • Response generation efficiency")
+        print("      • Token cost analysis and optimization")
+        
+        # Workflow Benefits
+        print("\n🎯 WORKFLOW BENEFITS")
+        print("   This enhanced architecture provides several key advantages:")
+        print("   ")
+        print("   🚀 Efficiency:")
+        print("      • Intelligent tool routing reduces unnecessary executions")
+        print("      • Conditional routing optimizes workflow paths")
+        print("      • Fallback mechanisms ensure reliability")
+        print("   ")
+        print("   🧠 Intelligence:")
+        print("      • Context-aware tool selection")
+        print("      • Adaptive routing based on question complexity")
+        print("      • Multi-tool integration for comprehensive analysis")
+        print("   ")
+        print("   📊 Transparency:")
+        print("      • Complete visibility into tool usage")
+        print("      • Detailed performance metrics and analytics")
+        print("      • Full audit trail for compliance and debugging")
+        print("   ")
+        print("   🔧 Maintainability:")
+        print("      • Clear separation of concerns")
+        print("      • Modular tool architecture")
+        print("      • Easy addition of new tools and capabilities")
+        
+        # Usage Examples
+        print("\n💡 USAGE EXAMPLES")
+        print("   The workflow handles various types of financial analysis questions:")
+        print("   ")
+        print("   🔴 AWS Cost Analysis:")
+        print("      • Question: 'What are our AWS costs for this month?'")
+        print("      • Classification: aws_costs")
+        print("      • Route: classify_question → retrieve_aws_data")
+        print("      • Output: Comprehensive cloud cost analysis with anomalies")
+        print("   ")
+        print("   🟡 Budget Tracking:")
+        print("      • Question: 'How is our budget tracking across projects?'")
+        print("      • Classification: budget")
+        print("      • Route: classify_question → retrieve_budget_data")
+        print("      • Output: Project budget performance with variance analysis")
+        print("   ")
+        print("   🟢 Vendor Spending:")
+        print("      • Question: 'What are our vendor spending patterns?'")
+        print("      • Classification: vendor_spend")
+        print("      • Route: classify_question → retrieve_vendor_data")
+        print("      • Output: Vendor performance insights with risk assessment")
+        print("   ")
+        print("   🌟 Complex Analysis:")
+        print("      • Question: 'Show me our cloud costs and budget variances'")
+        print("      • Classification: aws_costs (primary) + budget (secondary)")
+        print("      • Route: Multiple tool execution via retriever agent")
+        print("      • Output: Integrated analysis across multiple data sources")
+        
+        print("\n" + "="*100)
+        print("🎉 Enhanced Auto-Spend Workflow Display Complete!")
+        print("   Use workflow.visualize_workflow() to see the interactive HTML diagram")
+        print("   Use workflow.display_latency_metrics() to see performance analytics")
+        print("="*100)
